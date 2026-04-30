@@ -80,21 +80,36 @@ COLUMN_ALIASES = {
 
 
 # ============================================================
-# STYLES — adapt to both light and dark mode
+# STYLES — base styles + light/dark theme overrides
 # ============================================================
-COMPACT_CSS = """
+BASE_CSS = """
 <style>
+/* Hide Streamlit's built-in three-dots menu, deploy button, and footer */
+[data-testid="stMainMenu"] { display: none !important; }
+[data-testid="stToolbar"] { display: none !important; }
+[data-testid="stDeployButton"] { display: none !important; }
+[data-testid="stStatusWidget"] { display: none !important; }
+button[kind="header"] { display: none !important; }
+header[data-testid="stHeader"] { background: transparent; height: 0; }
+footer { display: none !important; }
+#MainMenu { display: none !important; }
+
+/* Layout */
 .block-container {
-    padding-top: 2rem;
+    padding-top: 1rem;
     padding-bottom: 3rem;
     max-width: 900px;
 }
+
+/* Headers */
 h2, h3 {
     margin-top: 1.5rem !important;
     margin-bottom: 0.5rem !important;
 }
 h2 { font-size: 1.35rem !important; }
 h3 { font-size: 1.1rem !important; }
+
+/* Compact form controls */
 div[data-baseweb="select"] > div {
     min-height: 36px !important;
 }
@@ -104,6 +119,87 @@ div[data-baseweb="select"] > div {
 .stTextArea textarea {
     padding: 0.5rem 0.75rem !important;
 }
+
+/* Theme toggle button — small, icon-only */
+div[data-testid="column"]:last-child .stButton > button[data-testid="baseButton-secondary"] {
+    padding: 0.25rem 0.5rem;
+    min-height: 32px;
+    font-size: 1.1rem;
+    line-height: 1;
+}
+</style>
+"""
+
+DARK_CSS = """
+<style>
+/* App-wide dark background */
+.stApp { background-color: #0e1117 !important; }
+
+/* Text colors */
+.stApp, .stApp p, .stApp h1, .stApp h2, .stApp h3,
+.stApp h4, .stApp h5, .stApp h6, .stApp label, .stApp span,
+.stApp li, .stApp strong { color: #fafafa !important; }
+
+[data-testid="stCaptionContainer"], small { color: #9aa0a6 !important; }
+
+/* Inputs */
+.stTextInput input, .stTextArea textarea {
+    background-color: #262730 !important;
+    color: #fafafa !important;
+    border-color: #3d4049 !important;
+}
+
+/* Selectboxes */
+div[data-baseweb="select"] > div {
+    background-color: #262730 !important;
+    border-color: #3d4049 !important;
+}
+div[data-baseweb="select"] * { color: #fafafa !important; }
+ul[role="listbox"] {
+    background-color: #262730 !important;
+    border-color: #3d4049 !important;
+}
+ul[role="listbox"] li { color: #fafafa !important; }
+ul[role="listbox"] li[aria-selected="true"],
+ul[role="listbox"] li:hover { background-color: #3d4049 !important; }
+
+/* File uploader */
+[data-testid="stFileUploader"] section {
+    background-color: #1c1f26 !important;
+    border-color: #3d4049 !important;
+}
+[data-testid="stFileUploader"] section * { color: #fafafa !important; }
+
+/* Code & JSON blocks */
+code, [data-testid="stCodeBlock"], [data-testid="stJson"] {
+    background-color: #262730 !important;
+    color: #fafafa !important;
+}
+
+/* Expanders */
+[data-testid="stExpander"] {
+    background-color: #1c1f26 !important;
+    border-color: #3d4049 !important;
+}
+[data-testid="stExpander"] * { color: #fafafa !important; }
+
+/* Metrics */
+[data-testid="stMetric"] { background-color: #1c1f26 !important; padding: 0.5rem; border-radius: 6px; }
+[data-testid="stMetricValue"] { color: #fafafa !important; }
+[data-testid="stMetricLabel"] { color: #9aa0a6 !important; }
+
+/* Buttons (non-primary) */
+.stButton > button {
+    background-color: #262730 !important;
+    color: #fafafa !important;
+    border-color: #3d4049 !important;
+}
+
+/* Dataframe */
+[data-testid="stDataFrame"] { background-color: #1c1f26 !important; }
+
+/* Progress bar track */
+[data-testid="stProgress"] > div { background-color: #262730 !important; }
 </style>
 """
 
@@ -183,13 +279,29 @@ def safe_value(val, col_type=None):
 # MAIN
 # ============================================================
 def main():
-    st.markdown(COMPACT_CSS, unsafe_allow_html=True)
+    # Initialize theme state
+    if "theme" not in st.session_state:
+        st.session_state.theme = "light"
+    is_dark = st.session_state.theme == "dark"
+
+    # Inject base styles (always)
+    st.markdown(BASE_CSS, unsafe_allow_html=True)
+
+    # Inject dark theme styles only when dark mode is active
+    if is_dark:
+        st.markdown(DARK_CSS, unsafe_allow_html=True)
+
+    # Top bar with theme toggle (right-aligned)
+    spacer, toggle = st.columns([20, 1])
+    with toggle:
+        icon = "☀️" if is_dark else "🌙"
+        next_mode = "light" if is_dark else "dark"
+        if st.button(icon, key="theme_toggle", help=f"Switch to {next_mode} mode"):
+            st.session_state.theme = next_mode
+            st.rerun()
 
     st.title("📥 Lead Uploader")
-    st.caption(
-        "Upload a CSV → set tags → map columns → push to Supabase. "
-        "Toggle light/dark mode from the menu (≡) in the top-right."
-    )
+    st.caption("Upload a CSV → set tags → map columns → push to Supabase.")
 
     # ---- 1. Upload ----
     st.subheader("1. Upload CSV")
