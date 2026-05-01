@@ -30,7 +30,7 @@ LEAD_COLUMNS = [
     {"name": "normalized_first_name", "label": "Normalized first name", "required": False},
     {"name": "last_name", "label": "Last name", "required": False},
     {"name": "full_name", "label": "Full name", "required": False},
-    {"name": "email", "label": "Email", "required": True},
+    {"name": "email", "label": "Email", "required": False},
     {"name": "person_linkedin_url", "label": "Person LinkedIn URL", "required": False},
     {"name": "company_name", "label": "Company name", "required": False},
     {"name": "normalized_company_name", "label": "Normalized company name", "required": False},
@@ -275,6 +275,53 @@ def safe_value(val, col_type=None):
     return s
 
 
+def normalize_linkedin(url: str) -> str:
+    """Strip scheme, www, query params, trailing slash. Lowercase."""
+    url = url.strip().lower()
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^www\.", "", url)
+    url = url.split("?")[0].rstrip("/")
+    return url
+
+
+def make_dedupe_key(row: dict):
+    """
+    Three-tier identity key for a lead:
+      Tier 1 — email:<lowercased email>            (most reliable)
+      Tier 2 — li:<normalized linkedin url>         (next best)
+      Tier 3 — nct:<name>|<company>|<title>         (fallback; collision-prone for common names,
+                                                     mitigated by including title)
+
+    Returns None if the row has no identity at all (skip these rows).
+    """
+    email = row.get("email")
+    if email:
+        return f"email:{email.strip().lower()}"
+
+    linkedin = row.get("person_linkedin_url")
+    if linkedin:
+        return f"li:{normalize_linkedin(linkedin)}"
+
+    # Tier 3: derive name and company
+    full_name = row.get("full_name")
+    if not full_name:
+        first = row.get("first_name") or ""
+        last = row.get("last_name") or ""
+        full_name = f"{first} {last}".strip()
+
+    company = row.get("normalized_company_name") or row.get("company_name")
+    title = row.get("job_title") or ""
+
+    name_slug = slugify(full_name)
+    company_slug = slugify(company)
+    title_slug = slugify(title)
+
+    if not name_slug or not company_slug:
+        return None  # not enough identity to dedupe safely
+
+    return f"nct:{name_slug}|{company_slug}|{title_slug}"
+
+
 # ============================================================
 # MAIN
 # ============================================================
@@ -432,8 +479,21 @@ def main():
         errors.append("Client is required.")
     if not list_slug:
         errors.append("List tag is required.")
-    if mapping.get("email") == "— skip —":
-        errors.append("Email column must be mapped.")
+
+    # Sanity check: the row needs *some* identity source mapped.
+    # Either email, OR linkedin, OR (full_name OR (first_name+last_name)) AND company_name.
+    has_email = mapping.get("email") != "— skip —"
+    has_linkedin = mapping.get("person_linkedin_url") != "— skip —"
+    has_name = (
+        mapping.get("full_name") != "— skip —"
+        or (mapping.get("first_name") != "— skip —" and mapping.get("last_name") != "— skip —")
+    )
+    has_company = mapping.get("company_name") != "— skip —" or mapping.get("normalized_company_name") != "— skip —"
+    if not (has_email or has_linkedin or (has_name and has_company)):
+        errors.append(
+            "At least one identity source must be mapped: email, LinkedIn URL, "
+            "or both (full name OR first+last name) AND company name."
+        )
 
     if errors:
         st.subheader("4. Issues to fix")
@@ -441,7 +501,7 @@ def main():
             st.error(e)
         return
 
-    # Build rows
+    # Build rows + attach dedupe key
     def build_row(csv_row) -> dict:
         row = {
             "client": client,
@@ -455,27 +515,58 @@ def main():
                 row[col["name"]] = None
             else:
                 row[col["name"]] = safe_value(csv_row[csv_col], col.get("type"))
+
+        # Lowercase email at this point (used for both storage and key)
+        if row.get("email"):
+            row["email"] = row["email"].strip().lower()
+
+        row["dedupe_key"] = make_dedupe_key(row)
         return row
 
     all_rows = [build_row(df.iloc[i]) for i in range(len(df))]
-    valid_rows = [r for r in all_rows if r.get("email")]
-    invalid_count = len(all_rows) - len(valid_rows)
+    rows_with_identity = [r for r in all_rows if r["dedupe_key"]]
+    no_identity_count = len(all_rows) - len(rows_with_identity)
 
+    # In-batch dedupe by (client, dedupe_key) — same key in same upload = same person
     seen = set()
     deduped_rows = []
-    for r in valid_rows:
-        key = (r["client"], r["email"].lower())
+    for r in rows_with_identity:
+        key = (r["client"], r["dedupe_key"])
         if key not in seen:
             seen.add(key)
-            r["email"] = r["email"].lower().strip()
             deduped_rows.append(r)
-    in_batch_dupes = len(valid_rows) - len(deduped_rows)
+    in_batch_dupes = len(rows_with_identity) - len(deduped_rows)
+
+    # Categorize the kept rows by which dedupe tier they're using
+    tier_counts = {"email": 0, "linkedin": 0, "name+company+title": 0}
+    for r in deduped_rows:
+        k = r["dedupe_key"]
+        if k.startswith("email:"):
+            tier_counts["email"] += 1
+        elif k.startswith("li:"):
+            tier_counts["linkedin"] += 1
+        else:
+            tier_counts["name+company+title"] += 1
 
     st.subheader("4. Review")
     m1, m2, m3 = st.columns(3)
     m1.metric("Ready to upload", f"{len(deduped_rows):,}")
-    m2.metric("Skipped (no email)", f"{invalid_count:,}")
+    m2.metric("Skipped (no identity)", f"{no_identity_count:,}")
     m3.metric("In-batch duplicates", f"{in_batch_dupes:,}")
+
+    st.caption(
+        f"**Identity tiers:** "
+        f"{tier_counts['email']:,} by email · "
+        f"{tier_counts['linkedin']:,} by LinkedIn · "
+        f"{tier_counts['name+company+title']:,} by name+company+title"
+    )
+
+    if no_identity_count > 0:
+        st.info(
+            f"{no_identity_count:,} row(s) had neither an email, a LinkedIn URL, "
+            f"nor enough data to build a name+company key. They will be skipped — "
+            f"there's no way to dedupe them safely."
+        )
 
     with st.expander("Preview first 3 rows as they will land in Supabase"):
         st.json(deduped_rows[:3])
@@ -506,7 +597,7 @@ def main():
             batch = deduped_rows[i : i + batch_size]
             try:
                 client_sb.table("leads").upsert(
-                    batch, on_conflict="client,email"
+                    batch, on_conflict="client,dedupe_key"
                 ).execute()
                 success_count += len(batch)
             except Exception as e:
