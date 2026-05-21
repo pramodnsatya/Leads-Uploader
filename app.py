@@ -1,8 +1,9 @@
 """
 Lead Uploader — internal Founderled tool.
 
-Reads a CSV, lets you map columns to the Supabase `leads` schema,
-configure tags as key/value inputs, preview, and upsert in batches.
+The CSV columns are the source of truth. Maps directly to the Supabase `leads`
+schema, dedupes via a three-tier identity key (email > LinkedIn > name+company),
+and upserts in batches.
 """
 
 import os
@@ -25,180 +26,88 @@ st.set_page_config(
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "")
 
+# Columns in the canonical CSV format, in order. Each maps directly to a
+# column in the Supabase `leads` table.
 LEAD_COLUMNS = [
-    {"name": "first_name", "label": "First name", "required": False},
-    {"name": "normalized_first_name", "label": "Normalized first name", "required": False},
-    {"name": "last_name", "label": "Last name", "required": False},
-    {"name": "full_name", "label": "Full name", "required": False},
-    {"name": "email", "label": "Email", "required": False},
-    {"name": "person_linkedin_url", "label": "Person LinkedIn URL", "required": False},
-    {"name": "company_name", "label": "Company name", "required": False},
-    {"name": "normalized_company_name", "label": "Normalized company name", "required": False},
-    {"name": "company_domain", "label": "Company domain / website", "required": False},
-    {"name": "company_linkedin_url", "label": "Company LinkedIn URL", "required": False},
-    {"name": "job_title", "label": "Job title", "required": False},
-    {"name": "location_raw", "label": "Location (raw)", "required": False},
-    {"name": "city", "label": "City", "required": False},
-    {"name": "country", "label": "Country", "required": False},
-    {"name": "employee_count", "label": "Employee count", "required": False, "type": "int"},
-    {"name": "employee_range", "label": "Employee range", "required": False},
-    {"name": "number_of_connections", "label": "Connections", "required": False, "type": "int"},
-    {"name": "mx_records", "label": "MX records", "required": False, "type": "array"},
-]
-
-KNOWN_CLIENTS = [
-    "dagster",
-    "wispr-flow",
-    "soona",
-    "kastle",
-    "adaptational-ai",
-    "sunset",
-    "arist",
-    "epsilon3",
+    {"name": "client_name",            "label": "Client name",            "required": True},
+    {"name": "sheet_name",             "label": "Sheet name",             "required": False},
+    {"name": "persona_name",           "label": "Persona name",           "required": False},
+    {"name": "normalized_first_name",  "label": "Normalized first name",  "required": False},
+    {"name": "last_name",              "label": "Last name",              "required": False},
+    {"name": "full_name",              "label": "Full name",              "required": False},
+    {"name": "title",                  "label": "Title",                  "required": False},
+    {"name": "email",                  "label": "Email",                  "required": False},
+    {"name": "valid_emails",           "label": "Valid emails",           "required": False},
+    {"name": "catch_all_valid",        "label": "Catch all valid",        "required": False},
+    {"name": "linkedin",               "label": "LinkedIn",               "required": False},
+    {"name": "company_website",        "label": "Company website",        "required": False},
+    {"name": "cleaned_company_name",   "label": "Cleaned company name",   "required": False},
+    {"name": "location",               "label": "Location",               "required": False},
+    {"name": "company_linkedin",       "label": "Company LinkedIn",       "required": False},
 ]
 
 COLUMN_ALIASES = {
-    "first_name": ["firstname", "fname"],
-    "normalized_first_name": ["normalizedfirstname", "cleanfirstname", "cleanfname"],
-    "last_name": ["lastname", "lname", "surname"],
-    "full_name": ["fullname", "name"],
-    "email": ["email", "emailaddress", "workemail", "emails"],
-    "person_linkedin_url": ["personlinkedinurl", "personlinkedin", "linkedinurl", "linkedin"],
-    "company_name": ["companyname", "company"],
-    "normalized_company_name": ["normalizedcompanyname", "cleancompanyname"],
-    "company_domain": ["companydomain", "companywebsite", "domain", "website", "companydomainwebsite"],
-    "company_linkedin_url": ["companylinkedinurl", "companylinkedin"],
-    "job_title": ["jobtitle", "title", "position"],
-    "location_raw": ["location", "locationraw"],
-    "city": ["city"],
-    "country": ["country"],
-    "employee_count": ["employeecount", "employees", "headcount"],
-    "employee_range": ["employeerange", "companysize"],
-    "number_of_connections": ["numberofconnections", "connections", "numconnections"],
-    "mx_records": ["mxrecords", "mx", "mxdomain"],
+    "client_name":           ["clientname", "client"],
+    "sheet_name":            ["sheetname", "sourcesheet", "tab", "tabname"],
+    "persona_name":          ["personaname", "persona"],
+    "normalized_first_name": ["normalizedfirstname", "normalisedfirstname", "cleanfirstname", "cleanfname"],
+    "last_name":             ["lastname", "lname", "surname"],
+    "full_name":             ["fullname", "name"],
+    "title":                 ["title", "jobtitle", "position"],
+    "email":                 ["email", "emailaddress", "workemail"],
+    "valid_emails":          ["validemails", "validemail"],
+    "catch_all_valid":       ["catchallvalid", "catchall", "catchallemail"],
+    "linkedin":              ["linkedin", "personlinkedin", "personlinkedinurl", "linkedinurl"],
+    "company_website":       ["companywebsite", "website", "companydomain", "domain"],
+    "cleaned_company_name":  ["cleanedcompanyname", "cleancompanyname", "normalizedcompanyname"],
+    "location":              ["location"],
+    "company_linkedin":      ["companylinkedin", "companylinkedinurl"],
 }
 
 
 # ============================================================
-# STYLES — base styles + light/dark theme overrides
+# STYLES
 # ============================================================
 BASE_CSS = """
 <style>
-/* Hide Streamlit's built-in three-dots menu, deploy button, and footer */
-[data-testid="stMainMenu"] { display: none !important; }
-[data-testid="stToolbar"] { display: none !important; }
-[data-testid="stDeployButton"] { display: none !important; }
-[data-testid="stStatusWidget"] { display: none !important; }
-button[kind="header"] { display: none !important; }
+[data-testid="stMainMenu"], [data-testid="stToolbar"],
+[data-testid="stDeployButton"], [data-testid="stStatusWidget"],
+button[kind="header"], footer, #MainMenu { display: none !important; }
 header[data-testid="stHeader"] { background: transparent; height: 0; }
-footer { display: none !important; }
-#MainMenu { display: none !important; }
 
-/* Layout */
-.block-container {
-    padding-top: 1rem;
-    padding-bottom: 3rem;
-    max-width: 900px;
-}
-
-/* Headers */
-h2, h3 {
-    margin-top: 1.5rem !important;
-    margin-bottom: 0.5rem !important;
-}
+.block-container { padding-top: 1rem; padding-bottom: 3rem; max-width: 900px; }
+h2, h3 { margin-top: 1.5rem !important; margin-bottom: 0.5rem !important; }
 h2 { font-size: 1.35rem !important; }
 h3 { font-size: 1.1rem !important; }
 
-/* Compact form controls */
-div[data-baseweb="select"] > div {
-    min-height: 36px !important;
-}
-.stTextInput input {
-    padding: 0.4rem 0.75rem !important;
-}
-.stTextArea textarea {
-    padding: 0.5rem 0.75rem !important;
-}
-
-/* Theme toggle button — small, icon-only */
-div[data-testid="column"]:last-child .stButton > button[data-testid="baseButton-secondary"] {
-    padding: 0.25rem 0.5rem;
-    min-height: 32px;
-    font-size: 1.1rem;
-    line-height: 1;
-}
+div[data-baseweb="select"] > div { min-height: 36px !important; }
+.stTextInput input { padding: 0.4rem 0.75rem !important; }
+.stTextArea textarea { padding: 0.5rem 0.75rem !important; }
 </style>
 """
 
 DARK_CSS = """
 <style>
-/* App-wide dark background */
 .stApp { background-color: #0e1117 !important; }
-
-/* Text colors */
-.stApp, .stApp p, .stApp h1, .stApp h2, .stApp h3,
-.stApp h4, .stApp h5, .stApp h6, .stApp label, .stApp span,
-.stApp li, .stApp strong { color: #fafafa !important; }
-
+.stApp, .stApp p, .stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6,
+.stApp label, .stApp span, .stApp li, .stApp strong { color: #fafafa !important; }
 [data-testid="stCaptionContainer"], small { color: #9aa0a6 !important; }
-
-/* Inputs */
-.stTextInput input, .stTextArea textarea {
-    background-color: #262730 !important;
-    color: #fafafa !important;
-    border-color: #3d4049 !important;
-}
-
-/* Selectboxes */
-div[data-baseweb="select"] > div {
-    background-color: #262730 !important;
-    border-color: #3d4049 !important;
-}
+.stTextInput input, .stTextArea textarea { background-color: #262730 !important; color: #fafafa !important; border-color: #3d4049 !important; }
+div[data-baseweb="select"] > div { background-color: #262730 !important; border-color: #3d4049 !important; }
 div[data-baseweb="select"] * { color: #fafafa !important; }
-ul[role="listbox"] {
-    background-color: #262730 !important;
-    border-color: #3d4049 !important;
-}
+ul[role="listbox"] { background-color: #262730 !important; border-color: #3d4049 !important; }
 ul[role="listbox"] li { color: #fafafa !important; }
-ul[role="listbox"] li[aria-selected="true"],
-ul[role="listbox"] li:hover { background-color: #3d4049 !important; }
-
-/* File uploader */
-[data-testid="stFileUploader"] section {
-    background-color: #1c1f26 !important;
-    border-color: #3d4049 !important;
-}
+ul[role="listbox"] li[aria-selected="true"], ul[role="listbox"] li:hover { background-color: #3d4049 !important; }
+[data-testid="stFileUploader"] section { background-color: #1c1f26 !important; border-color: #3d4049 !important; }
 [data-testid="stFileUploader"] section * { color: #fafafa !important; }
-
-/* Code & JSON blocks */
-code, [data-testid="stCodeBlock"], [data-testid="stJson"] {
-    background-color: #262730 !important;
-    color: #fafafa !important;
-}
-
-/* Expanders */
-[data-testid="stExpander"] {
-    background-color: #1c1f26 !important;
-    border-color: #3d4049 !important;
-}
+code, [data-testid="stCodeBlock"], [data-testid="stJson"] { background-color: #262730 !important; color: #fafafa !important; }
+[data-testid="stExpander"] { background-color: #1c1f26 !important; border-color: #3d4049 !important; }
 [data-testid="stExpander"] * { color: #fafafa !important; }
-
-/* Metrics */
 [data-testid="stMetric"] { background-color: #1c1f26 !important; padding: 0.5rem; border-radius: 6px; }
 [data-testid="stMetricValue"] { color: #fafafa !important; }
 [data-testid="stMetricLabel"] { color: #9aa0a6 !important; }
-
-/* Buttons (non-primary) */
-.stButton > button {
-    background-color: #262730 !important;
-    color: #fafafa !important;
-    border-color: #3d4049 !important;
-}
-
-/* Dataframe */
+.stButton > button { background-color: #262730 !important; color: #fafafa !important; border-color: #3d4049 !important; }
 [data-testid="stDataFrame"] { background-color: #1c1f26 !important; }
-
-/* Progress bar track */
 [data-testid="stProgress"] > div { background-color: #262730 !important; }
 </style>
 """
@@ -219,45 +128,25 @@ def normalize_header(s: str) -> str:
     return re.sub(r"[\s_\-/]", "", (s or "").lower())
 
 
-def auto_detect_match(supabase_col: str, csv_columns: list):
-    aliases = set(COLUMN_ALIASES.get(supabase_col, []))
-    aliases.add(normalize_header(supabase_col))
+def auto_detect_match(col_name: str, csv_columns: list):
+    aliases = set(COLUMN_ALIASES.get(col_name, []))
+    aliases.add(normalize_header(col_name))
     for csv_col in csv_columns:
         if normalize_header(csv_col) in aliases:
             return csv_col
     return None
 
 
-def build_tags(list_slug, persona, themes_str, vertical, segment, custom_tags):
-    tags = []
-    if list_slug:
-        tags.append(f"list:{slugify(list_slug)}")
-    if persona:
-        tags.append(f"persona:{slugify(persona)}")
-    if themes_str:
-        for theme in themes_str.split(","):
-            theme = theme.strip()
-            if theme:
-                tags.append(f"theme:{slugify(theme)}")
-    if vertical:
-        tags.append(f"vertical:{slugify(vertical)}")
-    if segment:
-        tags.append(f"segment:{slugify(segment)}")
-    if custom_tags:
-        for line in custom_tags.splitlines():
-            line = line.strip()
-            if line and ":" in line:
-                tags.append(line)
-    seen = set()
-    out = []
-    for t in tags:
-        if t not in seen:
-            seen.add(t)
-            out.append(t)
-    return out
+def normalize_linkedin(url: str) -> str:
+    url = (url or "").strip().lower()
+    url = re.sub(r"^https?://", "", url)
+    url = re.sub(r"^www\.", "", url)
+    url = url.split("?")[0].rstrip("/")
+    return url
 
 
-def safe_value(val, col_type=None):
+def safe_value(val):
+    """Coerce a CSV value to a clean string. None for empty/NaN."""
     if val is None:
         return None
     if isinstance(val, float) and pd.isna(val):
@@ -265,80 +154,70 @@ def safe_value(val, col_type=None):
     s = str(val).strip()
     if s == "" or s.lower() == "nan":
         return None
-    if col_type == "int":
-        try:
-            return int(float(s.replace(",", "")))
-        except (ValueError, TypeError):
-            return None
-    if col_type == "array":
-        return [x.strip() for x in s.split(",") if x.strip()]
     return s
 
 
-def normalize_linkedin(url: str) -> str:
-    """Strip scheme, www, query params, trailing slash. Lowercase."""
-    url = url.strip().lower()
-    url = re.sub(r"^https?://", "", url)
-    url = re.sub(r"^www\.", "", url)
-    url = url.split("?")[0].rstrip("/")
-    return url
+def first_present(row: dict, *fields):
+    """Return the first non-empty value among the given fields."""
+    for f in fields:
+        v = row.get(f)
+        if v:
+            return v
+    return None
 
 
 def make_dedupe_key(row: dict):
     """
-    Three-tier identity key for a lead:
-      Tier 1 — email:<lowercased email>            (most reliable)
-      Tier 2 — li:<normalized linkedin url>         (next best)
-      Tier 3 — nct:<name>|<company>|<title>         (fallback; collision-prone for common names,
-                                                     mitigated by including title)
+    Three-tier identity key.
 
-    Returns None if the row has no identity at all (skip these rows).
+    Tier 1 — email: any of Email, Valid Emails, Catch All Valid (in that order)
+    Tier 2 — LinkedIn URL (normalized)
+    Tier 3 — full_name + company (website preferred, falling back to cleaned name)
+
+    Returns None if the row has no usable identity at all.
     """
-    email = row.get("email")
+    # Tier 1 — email
+    email = first_present(row, "email", "valid_emails", "catch_all_valid")
     if email:
         return f"email:{email.strip().lower()}"
 
-    linkedin = row.get("person_linkedin_url")
+    # Tier 2 — LinkedIn URL
+    linkedin = row.get("linkedin")
     if linkedin:
         return f"li:{normalize_linkedin(linkedin)}"
 
-    # Tier 3: derive name and company
-    full_name = row.get("full_name")
-    if not full_name:
-        first = row.get("first_name") or ""
+    # Tier 3 — name + company
+    name = row.get("full_name")
+    if not name:
+        first = row.get("normalized_first_name") or ""
         last = row.get("last_name") or ""
-        full_name = f"{first} {last}".strip()
+        name = f"{first} {last}".strip()
 
-    company = row.get("normalized_company_name") or row.get("company_name")
-    title = row.get("job_title") or ""
+    company = first_present(row, "company_website", "cleaned_company_name")
 
-    name_slug = slugify(full_name)
+    name_slug = slugify(name)
     company_slug = slugify(company)
-    title_slug = slugify(title)
 
-    if not name_slug or not company_slug:
-        return None  # not enough identity to dedupe safely
+    if name_slug and company_slug:
+        return f"nc:{name_slug}|{company_slug}"
 
-    return f"nct:{name_slug}|{company_slug}|{title_slug}"
+    return None
 
 
 # ============================================================
 # MAIN
 # ============================================================
 def main():
-    # Initialize theme state
+    # Theme state
     if "theme" not in st.session_state:
         st.session_state.theme = "light"
     is_dark = st.session_state.theme == "dark"
 
-    # Inject base styles (always)
     st.markdown(BASE_CSS, unsafe_allow_html=True)
-
-    # Inject dark theme styles only when dark mode is active
     if is_dark:
         st.markdown(DARK_CSS, unsafe_allow_html=True)
 
-    # Top bar with theme toggle (right-aligned)
+    # Top-right theme toggle
     spacer, toggle = st.columns([20, 1])
     with toggle:
         icon = "☀️" if is_dark else "🌙"
@@ -348,7 +227,7 @@ def main():
             st.rerun()
 
     st.title("📥 Lead Uploader")
-    st.caption("Upload a CSV → set tags → map columns → push to Supabase.")
+    st.caption("Upload a CSV → confirm column mappings → push to Supabase.")
 
     # ---- 1. Upload ----
     st.subheader("1. Upload CSV")
@@ -372,88 +251,9 @@ def main():
 
     csv_columns = list(df.columns)
 
-    # ---- 2. Client + tags ----
-    st.subheader("2. Client & tags")
-    st.caption("These are applied to every row in this upload.")
-
-    # Client
-    c1, c2 = st.columns([1, 2], vertical_alignment="center")
-    with c1:
-        st.markdown("**Client** <span style='color:#ef4444;'>＊</span>", unsafe_allow_html=True)
-    with c2:
-        client_choice = st.selectbox(
-            "Client",
-            options=KNOWN_CLIENTS + ["+ Add new client"],
-            label_visibility="collapsed",
-        )
-    if client_choice == "+ Add new client":
-        c1, c2 = st.columns([1, 2], vertical_alignment="center")
-        with c1:
-            st.markdown("**New client slug**")
-        with c2:
-            new_client = st.text_input(
-                "new_client", placeholder="e.g. acme-corp", label_visibility="collapsed"
-            )
-            client = slugify(new_client) if new_client else ""
-    else:
-        client = client_choice
-
-    # Source sheet/tab name (optional — only relevant if this CSV came from one tab of a multi-tab Sheet)
-    c1, c2 = st.columns([1, 2], vertical_alignment="center")
-    with c1:
-        st.markdown("**Source sheet**")
-    with c2:
-        source_sheet = st.text_input(
-            "source_sheet",
-            placeholder="Optional — original Google Sheet tab name, e.g. Engineering",
-            label_visibility="collapsed",
-            help="Only fill in if this CSV is one tab from a multi-tab Google Sheet. Leave blank otherwise.",
-        )
-
-    # Tag inputs (label-on-left layout)
-    def tag_row(label, key, placeholder, required=False):
-        c1, c2 = st.columns([1, 2], vertical_alignment="center")
-        with c1:
-            marker = " <span style='color:#ef4444;'>＊</span>" if required else ""
-            st.markdown(f"**{label}**{marker}", unsafe_allow_html=True)
-        with c2:
-            return st.text_input(
-                label=label,
-                key=key,
-                placeholder=placeholder,
-                label_visibility="collapsed",
-            )
-
-    list_slug = tag_row("List", "tag_list", "e.g. dagster-2025-q1-eng-leaders", required=True)
-    persona = tag_row("Persona", "tag_persona", "e.g. eng-leader")
-    themes = tag_row("Theme(s)", "tag_themes", "e.g. tech-forward, high-growth (comma-separated)")
-    vertical = tag_row("Vertical", "tag_vertical", "e.g. fintech")
-    segment = tag_row("Segment", "tag_segment", "e.g. data-platform")
-
-    # Custom tags
-    c1, c2 = st.columns([1, 2], vertical_alignment="top")
-    with c1:
-        st.markdown("**Custom tags**")
-        st.caption("One per line, with prefix.")
-    with c2:
-        custom_tags = st.text_area(
-            "custom_tags",
-            placeholder="campaign:warm-intro\nsource:dagster-reuse",
-            height=70,
-            label_visibility="collapsed",
-        )
-
-    preview_tags = build_tags(list_slug, persona, themes, vertical, segment, custom_tags)
-    if preview_tags:
-        st.caption("**Tags that will be applied:**")
-        st.code(", ".join(preview_tags), language=None)
-
-    # ---- 3. Column mapping ----
-    st.subheader("3. Column mapping")
-    st.caption(
-        "Supabase columns on the left, CSV columns on the right. "
-        "Auto-detected matches are pre-selected — override anything that looks wrong."
-    )
+    # ---- 2. Column mapping ----
+    st.subheader("2. Column mapping")
+    st.caption("Auto-detected from CSV headers. Override anything that looks wrong.")
 
     mapping = {}
     for col in LEAD_COLUMNS:
@@ -473,72 +273,78 @@ def main():
                 label_visibility="collapsed",
             )
 
-    # ---- 4. Validate ----
+    # ---- Validate mapping ----
     errors = []
-    if not client:
-        errors.append("Client is required.")
-    if not list_slug:
-        errors.append("List tag is required.")
+    if mapping.get("client_name") == "— skip —":
+        errors.append("Client name column must be mapped.")
 
-    # Sanity check: the row needs *some* identity source mapped.
-    # Either email, OR linkedin, OR (full_name OR (first_name+last_name)) AND company_name.
-    has_email = mapping.get("email") != "— skip —"
-    has_linkedin = mapping.get("person_linkedin_url") != "— skip —"
-    has_name = (
-        mapping.get("full_name") != "— skip —"
-        or (mapping.get("first_name") != "— skip —" and mapping.get("last_name") != "— skip —")
+    has_email_col = any(
+        mapping.get(f) != "— skip —" for f in ("email", "valid_emails", "catch_all_valid")
     )
-    has_company = mapping.get("company_name") != "— skip —" or mapping.get("normalized_company_name") != "— skip —"
-    if not (has_email or has_linkedin or (has_name and has_company)):
+    has_linkedin = mapping.get("linkedin") != "— skip —"
+    has_name = mapping.get("full_name") != "— skip —" or (
+        mapping.get("normalized_first_name") != "— skip —"
+        and mapping.get("last_name") != "— skip —"
+    )
+    has_company = (
+        mapping.get("company_website") != "— skip —"
+        or mapping.get("cleaned_company_name") != "— skip —"
+    )
+    if not (has_email_col or has_linkedin or (has_name and has_company)):
         errors.append(
-            "At least one identity source must be mapped: email, LinkedIn URL, "
-            "or both (full name OR first+last name) AND company name."
+            "At least one identity source needed: an email column, LinkedIn, "
+            "or both (name + company)."
         )
 
     if errors:
-        st.subheader("4. Issues to fix")
+        st.subheader("3. Issues to fix")
         for e in errors:
             st.error(e)
         return
 
-    # Build rows + attach dedupe key
+    # ---- Build rows ----
     def build_row(csv_row) -> dict:
-        row = {
-            "client": client,
-            "tags": preview_tags,
-            "source_file": uploaded.name,
-            "source_sheet": source_sheet or None,
-        }
+        row = {}
         for col in LEAD_COLUMNS:
             csv_col = mapping[col["name"]]
             if csv_col == "— skip —":
                 row[col["name"]] = None
             else:
-                row[col["name"]] = safe_value(csv_row[csv_col], col.get("type"))
+                row[col["name"]] = safe_value(csv_row[csv_col])
 
-        # Lowercase email at this point (used for both storage and key)
-        if row.get("email"):
-            row["email"] = row["email"].strip().lower()
+        # Normalize client_name to a slug (e.g., "Soona" -> "soona")
+        if row.get("client_name"):
+            row["client_name"] = slugify(row["client_name"])
+
+        # Lowercase emails in place
+        for f in ("email", "valid_emails", "catch_all_valid"):
+            if row.get(f):
+                row[f] = row[f].strip().lower()
 
         row["dedupe_key"] = make_dedupe_key(row)
         return row
 
     all_rows = [build_row(df.iloc[i]) for i in range(len(df))]
-    rows_with_identity = [r for r in all_rows if r["dedupe_key"]]
-    no_identity_count = len(all_rows) - len(rows_with_identity)
 
-    # In-batch dedupe by (client, dedupe_key) — same key in same upload = same person
+    # Drop rows that lack both client_name and a dedupe key
+    rows_with_identity = [r for r in all_rows if r.get("client_name") and r["dedupe_key"]]
+    missing_client = sum(1 for r in all_rows if not r.get("client_name"))
+    missing_identity = sum(
+        1 for r in all_rows if r.get("client_name") and not r["dedupe_key"]
+    )
+
+    # In-batch dedupe by (client_name, dedupe_key)
     seen = set()
     deduped_rows = []
     for r in rows_with_identity:
-        key = (r["client"], r["dedupe_key"])
-        if key not in seen:
-            seen.add(key)
+        k = (r["client_name"], r["dedupe_key"])
+        if k not in seen:
+            seen.add(k)
             deduped_rows.append(r)
     in_batch_dupes = len(rows_with_identity) - len(deduped_rows)
 
-    # Categorize the kept rows by which dedupe tier they're using
-    tier_counts = {"email": 0, "linkedin": 0, "name+company+title": 0}
+    # Categorize kept rows by tier
+    tier_counts = {"email": 0, "linkedin": 0, "name+company": 0}
     for r in deduped_rows:
         k = r["dedupe_key"]
         if k.startswith("email:"):
@@ -546,33 +352,34 @@ def main():
         elif k.startswith("li:"):
             tier_counts["linkedin"] += 1
         else:
-            tier_counts["name+company+title"] += 1
+            tier_counts["name+company"] += 1
 
-    st.subheader("4. Review")
+    st.subheader("3. Review")
     m1, m2, m3 = st.columns(3)
     m1.metric("Ready to upload", f"{len(deduped_rows):,}")
-    m2.metric("Skipped (no identity)", f"{no_identity_count:,}")
+    m2.metric("Skipped (no identity)", f"{missing_identity + missing_client:,}")
     m3.metric("In-batch duplicates", f"{in_batch_dupes:,}")
 
     st.caption(
-        f"**Identity tiers:** "
+        f"**Dedupe tiers:** "
         f"{tier_counts['email']:,} by email · "
         f"{tier_counts['linkedin']:,} by LinkedIn · "
-        f"{tier_counts['name+company+title']:,} by name+company+title"
+        f"{tier_counts['name+company']:,} by name+company"
     )
 
-    if no_identity_count > 0:
+    if missing_client > 0:
+        st.warning(f"{missing_client:,} row(s) skipped: no client_name value.")
+    if missing_identity > 0:
         st.info(
-            f"{no_identity_count:,} row(s) had neither an email, a LinkedIn URL, "
-            f"nor enough data to build a name+company key. They will be skipped — "
-            f"there's no way to dedupe them safely."
+            f"{missing_identity:,} row(s) skipped: had a client but no email, "
+            f"LinkedIn, or name+company. Nothing identifies them as a person."
         )
 
     with st.expander("Preview first 3 rows as they will land in Supabase"):
         st.json(deduped_rows[:3])
 
-    # ---- 5. Upload ----
-    st.subheader("5. Upload")
+    # ---- 4. Upload ----
+    st.subheader("4. Upload")
     if not SUPABASE_URL or not SUPABASE_KEY:
         st.error(
             "Supabase credentials not configured. "
@@ -597,7 +404,7 @@ def main():
             batch = deduped_rows[i : i + batch_size]
             try:
                 client_sb.table("leads").upsert(
-                    batch, on_conflict="client,dedupe_key"
+                    batch, on_conflict="client_name,dedupe_key"
                 ).execute()
                 success_count += len(batch)
             except Exception as e:
@@ -618,7 +425,4 @@ def main():
             )
 
 
-# ============================================================
-# RUN
-# ============================================================
 main()
